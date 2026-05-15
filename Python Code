@@ -1,0 +1,542 @@
+import sys
+import copy
+import threading
+import numpy as np
+from PIL import Image
+import rawpy
+from scipy.ndimage import gaussian_filter
+from skimage.color import rgb2hsv, hsv2rgb
+from skimage.restoration import denoise_bilateral
+
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QFileDialog,
+    QGraphicsView, QGraphicsScene, QGraphicsPixmapItem,
+    QVBoxLayout, QScrollArea, QLabel, QSpinBox,
+    QFrame, QToolBar, QSplitter
+)
+
+from PyQt6.QtGui import (
+    QPixmap, QImage, QAction, QPainter,
+    QShortcut, QKeySequence
+)
+
+from PyQt6.QtCore import Qt, QRectF, QTimer
+
+
+# =========================================================
+# DARK THEME
+# =========================================================
+
+DARK_THEME = """
+QWidget {
+    background:#0a0a0a;
+    color:#e6e6e6;
+    font-family:Segoe UI;
+}
+QFrame {
+    background:#111;
+    border-radius:10px;
+}
+QSpinBox {
+    background:#1a1a1a;
+    color:#fff;
+    border:1px solid #222;
+    padding:4px;
+}
+QLabel {
+    color:#ddd;
+}
+QToolBar {
+    background:#0f0f0f;
+    border:none;
+}
+"""
+
+
+# =========================================================
+# VIEWER
+# =========================================================
+
+class Viewer(QGraphicsView):
+    def __init__(self):
+        super().__init__()
+
+        self.scene = QGraphicsScene(self)
+        self.setScene(self.scene)
+
+        self.item = QGraphicsPixmapItem()
+        self.scene.addItem(self.item)
+
+        self.setRenderHints(
+            QPainter.RenderHint.SmoothPixmapTransform
+        )
+
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self.setDragMode(
+            QGraphicsView.DragMode.ScrollHandDrag
+        )
+
+        self.setTransformationAnchor(
+            QGraphicsView.ViewportAnchor.AnchorUnderMouse
+        )
+
+    def wheelEvent(self, event):
+        factor = 1.2 if event.angleDelta().y() > 0 else 1 / 1.2
+        self.scale(factor, factor)
+
+
+# =========================================================
+# APP
+# =========================================================
+
+class App(QMainWindow):
+
+    def __init__(self):
+        super().__init__()
+
+        self.setWindowTitle("RAW Engine")
+        self.resize(1600, 900)
+
+        self.original = None
+        self.preview = None
+
+        self.max_preview_dim = 1100
+
+        self.history = []
+        self.redo_stack = []
+
+        self.controls = {}
+
+        self.state = {
+            "exp": 0,
+            "contrast": 0,
+            "blacks": 0,
+            "shadows": 0,
+            "midtones": 0,
+            "highlights": 0,
+            "whites": 0,
+            "clarity": 0,
+            "vibrance": 0,
+            "sat": 0,
+            "sharpening": 0,
+            "dehaze": 0,
+            "noise_luma": 0,
+            "noise_chroma": 0,
+            "red_sat": 0,
+            "orange_sat": 0,
+            "yellow_sat": 0,
+            "green_sat": 0,
+            "cyan_sat": 0,
+            "blue_sat": 0,
+            "purple_sat": 0,
+            "magenta_sat": 0,
+            "curve_shadow": 0,
+            "curve_dark": 0,
+            "curve_mid": 0,
+            "curve_light": 0,
+            "curve_highlight": 0,
+        }
+
+        self.setStyleSheet(DARK_THEME)
+
+        self.viewer = Viewer()
+
+        self.timer = QTimer()
+        self.timer.setSingleShot(True)
+        self.timer.timeout.connect(self.render)
+        self.render_delay = 100
+
+        self.init_ui()
+        self.init_toolbar()
+
+        QShortcut(QKeySequence("Ctrl+Z"), self, self.undo)
+        QShortcut(QKeySequence("Ctrl+Y"), self, self.redo)
+
+    # =====================================================
+    # MODE SWITCH
+    # =====================================================
+
+    def set_mode(self, mode):
+        for group in self.groups.values():
+            for widget in group:
+                widget.setVisible(False)
+
+        for widget in self.groups[mode]:
+            widget.setVisible(True)
+
+    # =====================================================
+    # TOOLBAR
+    # =====================================================
+
+    def init_toolbar(self):
+
+        bar = QToolBar()
+        self.addToolBar(bar)
+
+        load = QAction("Load", self)
+        export = QAction("Export", self)
+        undo = QAction("Undo", self)
+        redo = QAction("Redo", self)
+
+        adj = QAction("Adjustments", self)
+        hsl = QAction("HSL", self)
+        curve = QAction("Curve", self)
+
+        load.triggered.connect(self.load)
+        export.triggered.connect(self.export)
+        undo.triggered.connect(self.undo)
+        redo.triggered.connect(self.redo)
+
+        adj.triggered.connect(lambda: self.set_mode("adjustments"))
+        hsl.triggered.connect(lambda: self.set_mode("hsl"))
+        curve.triggered.connect(lambda: self.set_mode("curve"))
+
+        bar.addAction(load)
+        bar.addAction(export)
+        bar.addSeparator()
+        bar.addAction(undo)
+        bar.addAction(redo)
+        bar.addSeparator()
+        bar.addAction(adj)
+        bar.addAction(hsl)
+        bar.addAction(curve)
+
+        fit = QAction("Fit", self)
+        fit.triggered.connect(self.fit_view)
+        bar.addAction(fit)
+
+    # =====================================================
+    # UI
+    # =====================================================
+
+    def init_ui(self):
+
+        self.panel_layout = QVBoxLayout()
+        self.panel_container = QFrame()
+        self.panel_container.setLayout(self.panel_layout)
+
+        self.scroll = QScrollArea()
+        self.scroll.setWidget(self.panel_container)
+        self.scroll.setWidgetResizable(True)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.addWidget(self.scroll)
+        splitter.addWidget(self.viewer)
+
+        splitter.setSizes([320, 1280])
+
+        self.setCentralWidget(splitter)
+
+        self.groups = {
+            "adjustments": [],
+            "hsl": [],
+            "curve": []
+        }
+
+        def add(name, group):
+
+            row = QFrame()
+            layout = QVBoxLayout(row)
+
+            label = QLabel(name)
+
+            slider = QSpinBox()
+            slider.setRange(-100, 100)
+
+            def update(v):
+                self.state[name] = v
+                self.redo_stack.clear()
+                if self.timer.isActive():
+                    self.timer.stop()
+                self.timer.start(self.render_delay)
+
+            slider.editingFinished.connect(self.push_history)
+            slider.valueChanged.connect(update)
+
+            self.controls[name] = slider
+
+            layout.addWidget(label)
+            layout.addWidget(slider)
+
+            self.panel_layout.addWidget(row)
+            self.groups[group].append(row)
+
+        for k in [
+            "exp","contrast","blacks","shadows","midtones",
+            "highlights","whites","clarity","vibrance","sat",
+            "sharpening","dehaze","noise_luma","noise_chroma"
+        ]:
+            add(k, "adjustments")
+
+        for c in ["red","orange","yellow","green","cyan","blue","purple","magenta"]:
+            add(f"{c}_sat", "hsl")
+
+        for k in [
+            "curve_shadow","curve_dark","curve_mid",
+            "curve_light","curve_highlight"
+        ]:
+            add(k, "curve")
+
+        self.set_mode("adjustments")
+
+    # =====================================================
+    # IMAGE PROCESSING
+    # =====================================================
+
+    def process_image(self, img, state=None):
+
+        x = img.copy()
+        s = self.state if state is None else state
+
+        lum = x.mean(axis=2, keepdims=True)
+
+        x *= 2.0 ** (s["exp"] / 100.0)
+
+        contrast = s["contrast"] / 100.0
+        x = (x - 0.5) * (1.0 + contrast) + 0.5
+
+        shadows = (1.0 - lum) ** 2
+        highlights = lum ** 2
+        midtones = 1.0 - (shadows + highlights)
+
+        x += shadows * (s["shadows"] / 100.0) * 0.20
+        x += highlights * (s["highlights"] / 100.0) * 0.20
+        x += midtones * (s["midtones"] / 100.0) * 0.15
+
+        x += (s["blacks"] / 100.0) * 0.06
+        x += (s["whites"] / 100.0) * 0.06
+
+        avg = x.mean(axis=2, keepdims=True)
+        x += (x - avg) * (s["vibrance"] / 200.0)
+
+        lum2 = x.mean(axis=2, keepdims=True)
+        x = lum2 + (x - lum2) * (1.0 + s["sat"] / 100.0)
+
+        # Clarity
+        if s["clarity"] != 0:
+            x += midtones * (s["clarity"] / 100.0) * 0.1
+
+        # Dehaze
+        if s["dehaze"] != 0:
+            x += (1 - midtones) * (s["dehaze"] / 100.0) * 0.1
+
+        x = np.clip(x, 0.0, 1.0)
+
+        # Noise reduction
+        if s["noise_luma"] > 0:
+            x = denoise_bilateral(
+                x,
+                sigma_color=0.003 + (s["noise_luma"] / 100.0) * 0.012,
+                sigma_spatial=1,
+                channel_axis=-1
+            )
+        if s["noise_chroma"] > 0:
+            for c in range(3):
+                x[:, :, c] = denoise_bilateral(
+                    x[:, :, c],
+                    sigma_color=0.003 + (s["noise_chroma"] / 100.0) * 0.012,
+                    sigma_spatial=1
+                )
+
+        # Sharpening
+        if s["sharpening"] > 0:
+            blurred = gaussian_filter(x, sigma=0.5, axes=(0, 1))
+            x = x + (x - blurred) * (s["sharpening"] / 100.0) * 0.5
+            x = np.clip(x, 0.0, 1.0)
+
+        # HSL Saturation
+        saturation_keys = [
+            "red_sat", "orange_sat", "yellow_sat", "green_sat",
+            "cyan_sat", "blue_sat", "purple_sat", "magenta_sat"
+        ]
+        if any(s[k] != 0 for k in saturation_keys):
+            with np.errstate(divide='ignore', invalid='ignore'):
+                hsv = rgb2hsv(np.clip(x, 0.0, 1.0), channel_axis=-1)
+            hues = {
+                "red": 0,
+                "orange": 30 / 360,
+                "yellow": 60 / 360,
+                "green": 120 / 360,
+                "cyan": 180 / 360,
+                "blue": 240 / 360,
+                "purple": 270 / 360,
+                "magenta": 300 / 360
+            }
+            for c, hue in hues.items():
+                mask = np.abs(hsv[:, :, 0] - hue) < 0.1
+                hsv[mask, 1] *= 1 + s[f"{c}_sat"] / 100.0
+            hsv[:, :, 1] = np.clip(hsv[:, :, 1], 0.0, 1.0)
+            x = hsv2rgb(hsv, channel_axis=-1)
+            x = np.clip(x, 0.0, 1.0)
+
+        # Curves
+        shadow_mask = (lum < 0.2).squeeze(axis=2)
+        dark_mask = ((lum >= 0.2) & (lum < 0.4)).squeeze(axis=2)
+        mid_mask = ((lum >= 0.4) & (lum < 0.6)).squeeze(axis=2)
+        light_mask = ((lum >= 0.6) & (lum < 0.8)).squeeze(axis=2)
+        highlight_mask = (lum >= 0.8).squeeze(axis=2)
+        x[shadow_mask] *= 1 + s["curve_shadow"] / 100.0
+        x[dark_mask] *= 1 + s["curve_dark"] / 100.0
+        x[mid_mask] *= 1 + s["curve_mid"] / 100.0
+        x[light_mask] *= 1 + s["curve_light"] / 100.0
+        x[highlight_mask] *= 1 + s["curve_highlight"] / 100.0
+
+        return np.clip(x, 0.0, 1.0)
+
+    # =====================================================
+    # RENDER
+    # =====================================================
+
+    def render(self):
+
+        if self.preview is None:
+            return
+
+        x = self.process_image(self.preview)
+
+        out = (x * 255).astype(np.uint8)
+
+        h, w = out.shape[:2]
+
+        self._buffer = out.tobytes()
+
+        qimg = QImage(
+            self._buffer,
+            w, h,
+            3 * w,
+            QImage.Format.Format_RGB888
+        )
+
+        pix = QPixmap.fromImage(qimg)
+
+        self.viewer.item.setPixmap(pix)
+        self.viewer.scene.setSceneRect(QRectF(pix.rect()))
+
+        self.fit_view()
+
+    # =====================================================
+    # FIT VIEW
+    # =====================================================
+
+    def fit_view(self):
+
+        pix = self.viewer.item.pixmap()
+        if pix.isNull():
+            return
+
+        scale = self.viewer.viewport().width() / pix.width()
+
+        self.viewer.resetTransform()
+        self.viewer.scale(scale, scale)
+
+    # =====================================================
+    # HISTORY
+    # =====================================================
+
+    def push_history(self):
+        self.history.append(copy.deepcopy(self.state))
+        if len(self.history) > 50:
+            self.history.pop(0)
+
+    def undo(self):
+        if not self.history:
+            return
+        self.redo_stack.append(copy.deepcopy(self.state))
+        self.state = self.history.pop()
+        self.sync_controls()
+        self.render()
+
+    def redo(self):
+        if not self.redo_stack:
+            return
+        self.history.append(copy.deepcopy(self.state))
+        self.state = self.redo_stack.pop()
+        self.sync_controls()
+        self.render()
+
+    def sync_controls(self):
+        for k, v in self.state.items():
+            if k in self.controls:
+                self.controls[k].blockSignals(True)
+                self.controls[k].setValue(v)
+                self.controls[k].blockSignals(False)
+
+    # =====================================================
+    # LOAD
+    # =====================================================
+
+    def load(self):
+
+        path, _ = QFileDialog.getOpenFileName(self)
+        if not path:
+            return
+
+        if path.split(".")[-1].lower() in ["cr2","nef","arw","dng","rw2","orf"]:
+            with rawpy.imread(path) as raw:
+                rgb = raw.postprocess(use_camera_wb=True, no_auto_bright=True)
+            img = rgb.astype(np.float32) / 255.0
+        else:
+            img = np.asarray(Image.open(path).convert("RGB"), np.float32) / 255.0
+
+        self.original = img
+
+        # Downsample for preview
+        h, w = img.shape[:2]
+        if max(h, w) > self.max_preview_dim:
+            scale = self.max_preview_dim / max(h, w)
+            new_w = int(w * scale)
+            new_h = int(h * scale)
+            img_pil = Image.fromarray((img * 255).astype(np.uint8))
+            img_pil = img_pil.resize((new_w, new_h), Image.LANCZOS)
+            self.preview = np.asarray(img_pil, np.float32) / 255.0
+        else:
+            self.preview = img
+
+        self.render()
+
+    # =====================================================
+    # EXPORT (LOSSLESS FIX)
+    # =====================================================
+
+    def export(self):
+
+        if self.original is None:
+            return
+
+        path, _ = QFileDialog.getSaveFileName(self)
+        if not path:
+            return
+
+        # FORCE LOSSLESS JPG FORMAT
+        if not path.lower().endswith(".jpg") and not path.lower().endswith(".jpeg"):
+            path += ".jpg"
+
+        state_copy = copy.deepcopy(self.state)
+        image_copy = self.original.copy()
+
+        worker = threading.Thread(
+            target=self._export_worker,
+            args=(image_copy, state_copy, path),
+            daemon=True
+        )
+        worker.start()
+
+    def _export_worker(self, image, state, path):
+        x = self.process_image(image, state)
+        out = (np.clip(x, 0, 1) * 255).astype(np.uint8)
+        Image.fromarray(out).save(
+            path,
+            format="JPEG",
+            quality=98
+        )
+
+
+# =========================================================
+# RUN
+# =========================================================
+
+app = QApplication(sys.argv)
+w = App()
+w.show()
+sys.exit(app.exec())
